@@ -21,7 +21,7 @@ Ausgabe im ZIP:
   verknuepfungen/   eine CSV je Objektpaar
   struktur/         Felder, Pipelines, Besitzer, Listen, Verknüpfungsarten
   rohdaten/         Originalantwort von HubSpot als JSON Lines (volle Genauigkeit)
-  dateien/          Anhänge
+  Anhänge liegen in eigenen Archiven HubSpot-Anhaenge_*.zip (nur neue je Lauf)
   00_Uebersicht.xlsx und LIESMICH.txt
 
 Alle Einstellungen kommen aus Umgebungsvariablen, siehe README.md.
@@ -72,6 +72,8 @@ NOW = dt.datetime.now(BERLIN)
 STAMP = NOW.strftime("%Y-%m-%d_%H%M")
 BACKUP_PREFIX = "HubSpot-Backup_"
 BACKUP_NAME = f"{BACKUP_PREFIX}{STAMP}"
+ANHANG_NAME = f"HubSpot-Anhaenge_{STAMP}"
+ANHANG_INDEX = "anhaenge_index.json"
 
 HUBSPOT_TOKEN = env("HUBSPOT_TOKEN")
 WORK_DIR = Path(env("WORK_DIR", "./backup_arbeit"))
@@ -575,7 +577,14 @@ def export_lists(hs: HubSpot, root: Path, rep: Report) -> None:
     log.info("Listen: %d, Mitgliedschaften: %d", len(lists), n)
 
 
-def export_files(hs: HubSpot, objects: dict[str, ObjectInfo], root: Path, rep: Report) -> None:
+def export_files(hs: HubSpot, objects: dict[str, ObjectInfo], root: Path, rep: Report,
+                 known: dict[str, str], new_dir: Path, archive_name: str) -> dict[str, str]:
+    """Lädt nur Anhänge, die noch in keinem früheren Anhang-Archiv liegen.
+
+    known:   Datei-ID -> Name des Archivs, in dem sie schon gesichert ist
+    new_dir: Ordner für neue Anhänge (wird als eigenes Archiv hochgeladen)
+    Rückgabe: neu gesicherte Datei-IDs -> archive_name
+    """
     refs: dict[str, list[str]] = defaultdict(list)
     for otype, info in objects.items():
         if "hs_attachment_ids" not in info.prop_by_name:
@@ -586,19 +595,22 @@ def export_files(hs: HubSpot, objects: dict[str, ObjectInfo], root: Path, rep: R
                 if fid.strip():
                     refs[fid.strip()].append(f"{otype}:{rec['id']}")
     if not refs:
-        return
-    folder = root / "dateien"
-    folder.mkdir(parents=True, exist_ok=True)
+        return {}
+    new_dir.mkdir(parents=True, exist_ok=True)
     rows, failed, denied = [], 0, 0
+    added: dict[str, str] = {}
     plain = requests.Session()
     for fid, used_by in refs.items():
+        if fid in known:
+            rows.append([fid, "", "", "", known[fid], "", " ".join(used_by)])
+            continue
         try:
             meta = hs.json("GET", f"/files/v3/files/{fid}/signed-url")
         except HubSpotError as exc:
             if exc.status in (401, 403):
                 denied += 1
             failed += 1
-            rows.append([fid, "", "", "", f"nicht abrufbar ({exc.status})", " ".join(used_by)])
+            rows.append([fid, "", "", "", "", f"nicht abrufbar ({exc.status})", " ".join(used_by)])
             continue
         name = safe_name(meta.get("name") or fid)
         ext = meta.get("extension") or ""
@@ -606,22 +618,26 @@ def export_files(hs: HubSpot, objects: dict[str, ObjectInfo], root: Path, rep: R
         try:
             with plain.get(meta["url"], stream=True, timeout=300) as r:
                 r.raise_for_status()
-                with (folder / fname).open("wb") as out:
+                with (new_dir / fname).open("wb") as out:
                     for block in r.iter_content(1024 * 1024):
                         out.write(block)
-            rows.append([fid, meta.get("name"), ext, meta.get("size"), f"dateien/{fname}", " ".join(used_by)])
+            added[fid] = archive_name
+            rows.append([fid, meta.get("name"), ext, meta.get("size"), archive_name, fname, " ".join(used_by)])
         except requests.RequestException as exc:
             failed += 1
-            rows.append([fid, meta.get("name"), ext, meta.get("size"),
+            rows.append([fid, meta.get("name"), ext, meta.get("size"), "",
                          f"Download fehlgeschlagen ({exc.__class__.__name__})", " ".join(used_by)])
     write_csv(root / "struktur" / "dateien.csv",
-              ["datei_id", "name", "endung", "groesse_bytes", "pfad_im_backup", "haengt_an"], rows)
-    rep.extra.append(("Dateianhänge", len(refs) - failed, "dateien/ (Liste: struktur/dateien.csv)"))
+              ["datei_id", "name", "endung", "groesse_bytes", "archiv", "datei_im_archiv", "haengt_an"], rows)
+    saved = len(refs) - failed
+    rep.extra.append(("Dateianhänge gesamt", saved, "Archive HubSpot-Anhaenge_*.zip (Liste: struktur/dateien.csv)"))
+    rep.extra.append(("davon heute neu gesichert", len(added), f"{archive_name}.zip" if added else ""))
     if denied:
         rep.skip(f"{denied} Anhänge ohne Berechtigung. Bereiche files und files.ui_hidden.read fehlen?")
     elif failed:
         rep.warn(f"{failed} von {len(refs)} Anhängen nicht gesichert, siehe struktur/dateien.csv")
-    log.info("Anhänge: %d gesichert, %d fehlgeschlagen", len(refs) - failed, failed)
+    log.info("Anhänge: %d bekannt, %d neu gesichert, %d fehlgeschlagen", len(refs) - len(added) - failed, len(added), failed)
+    return added
 
 
 # --------------------------------------------------------------------------
@@ -835,7 +851,8 @@ def write_overview(root: Path, rep: Report, objects: dict[str, ObjectInfo], hs_c
         "  verknuepfungen/  jede Verbindung zwischen zwei Datensätzen als eigene Zeile, mit Beschriftung.",
         "  struktur/        Feldbeschreibungen, Pipelines und Phasen, Besitzer, Listen, Anhangsverzeichnis.",
         "  rohdaten/        unveränderte Antworten von HubSpot (JSON Lines). Höchste Genauigkeit.",
-        "  dateien/         Anhänge aus Notizen, E-Mails und anderen Aktivitäten.",
+        "  Anhänge          liegen NICHT in diesem ZIP, sondern in den Archiven HubSpot-Anhaenge_*.zip im selben",
+        "                   Ordner. Jedes Archiv enthält die Anhänge, die seit dem vorherigen dazugekommen sind.",
         "",
         "WIEDERHERSTELLUNG IN EINEM ANDEREN CRM",
         "  1. Benutzer anlegen (struktur/besitzer.csv). hubspot_owner_id in den Daten zeigt auf owner_id.",
@@ -844,7 +861,8 @@ def write_overview(root: Path, rep: Report, objects: dict[str, ObjectInfo], hs_c
         "     danach Notizen, Anrufe, E-Mails, Meetings, Aufgaben.",
         "  4. Die alte hubspot_id bei jedem Import in ein eigenes Feld (z. B. \"HubSpot-ID alt\") übernehmen.",
         "     Darüber lassen sich die Verknüpfungen aus verknuepfungen/ wieder zuordnen.",
-        "  5. Anhänge aus dateien/ über struktur/dateien.csv (Spalte haengt_an) zuordnen.",
+        "  5. Anhänge: struktur/dateien.csv nennt je Datei das Archiv (Spalte archiv), den Dateinamen darin",
+        "     und den Datensatz, an dem sie hängt (Spalte haengt_an).",
         "",
         "Nicht enthalten, weil HubSpot dafür keine Exportschnittstelle bietet oder es keine Kundendaten sind:",
         "Berichte und Dashboards, Workflows, Sequenzen, E-Mail-Vorlagen, Marketing-E-Mails, Formulare, Website.",
@@ -881,22 +899,40 @@ class Graph:
     BASE = "https://graph.microsoft.com/v1.0"
 
     def __init__(self, tenant: str, client_id: str, secret: str):
+        self.tenant, self.client_id, self.secret = tenant, client_id, secret
+        self.session = requests.Session()
+        self.token_until = 0.0
+        self.drive_id = None
+        self.folder_id = None
+        self.login()
+
+    def login(self) -> None:
+        """Holt eine frische Anmeldung. Microsoft-Anmeldungen laufen nach ca. 60 Minuten ab."""
         resp = requests.post(
-            f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
-            data={"client_id": client_id, "client_secret": secret,
+            f"https://login.microsoftonline.com/{self.tenant}/oauth2/v2.0/token",
+            data={"client_id": self.client_id, "client_secret": self.secret,
                   "scope": "https://graph.microsoft.com/.default", "grant_type": "client_credentials"},
             timeout=60)
         if resp.status_code != 200:
             raise RuntimeError(f"Anmeldung bei Microsoft fehlgeschlagen: {resp.status_code} {resp.text[:300]}")
-        self.session = requests.Session()
-        self.session.headers["Authorization"] = f"Bearer {resp.json()['access_token']}"
-        self.drive_id = None
-        self.folder_id = None
+        data = resp.json()
+        self.session.headers["Authorization"] = f"Bearer {data['access_token']}"
+        # 5 Minuten Puffer vor dem echten Ablauf
+        self.token_until = time.monotonic() + int(data.get("expires_in", 3600)) - 300
+
+    def ensure_login(self) -> None:
+        if time.monotonic() >= self.token_until:
+            log.info("Microsoft-Anmeldung wird erneuert")
+            self.login()
 
     def call(self, method: str, path: str, ok=(200,), **kwargs):
         url = path if path.startswith("http") else self.BASE + path
         for attempt in range(6):
+            self.ensure_login()
             resp = self.session.request(method, url, timeout=300, **kwargs)
+            if resp.status_code == 401 and attempt == 0:
+                self.login()
+                continue
             if resp.status_code in (429, 500, 502, 503, 504):
                 time.sleep(float(resp.headers.get("Retry-After", 2 ** attempt)))
                 continue
@@ -956,6 +992,7 @@ class Graph:
                   data=text.encode("utf-8"), headers={"Content-Type": "application/json"})
 
     def read_text(self, name: str) -> str | None:
+        self.ensure_login()
         resp = self.session.get(self.BASE + self._item_path(name) + "/content", timeout=60)
         return resp.text if resp.status_code == 200 else None
 
@@ -1050,7 +1087,29 @@ def main() -> int:
     assoc = export_associations(hs, objects, root, rep)
     export_lists(hs, root, rep)
     if DOWNLOAD_FILES:
-        export_files(hs, objects, root, rep)
+        # Anhänge werden nur einmal gesichert, danach nur neue (eigene Archive HubSpot-Anhaenge_*.zip)
+        known: dict[str, str] = {}
+        if graph:
+            index_text = graph.read_text(ANHANG_INDEX)
+            if index_text:
+                try:
+                    known = json.loads(index_text)
+                except ValueError:
+                    rep.warn("Anhangs-Verzeichnis in SharePoint unlesbar, alle Anhänge werden neu gesichert")
+        new_dir = WORK_DIR / ANHANG_NAME
+        if new_dir.exists():
+            shutil.rmtree(new_dir)
+        added = export_files(hs, objects, root, rep, known, new_dir, ANHANG_NAME)
+        if added:
+            files_zip = make_zip(new_dir, OUT_DIR / f"{ANHANG_NAME}.zip", ZIP_PASSWORD)
+            log.info("Anhang-Archiv erstellt: %s (%.1f MB)", files_zip.name, files_zip.stat().st_size / 1e6)
+            shutil.rmtree(new_dir, ignore_errors=True)
+            if graph:
+                graph.upload(files_zip)
+                known.update(added)
+                graph.upload_text(ANHANG_INDEX, json.dumps(known, ensure_ascii=False))
+                if env("GITHUB_ACTIONS"):
+                    files_zip.unlink(missing_ok=True)
 
     log.info("Schreibe CSV und Excel …")
     lookup = build_name_lookup(objects, root)
