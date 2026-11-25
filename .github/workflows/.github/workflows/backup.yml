@@ -1,0 +1,45 @@
+name: HubSpot-Backup
+
+on:
+  schedule:
+    # 01:17 UTC = 02:17 Uhr (Winterzeit) bzw. 03:17 Uhr (Sommerzeit).
+    # Läuft vor der Dublettenbereinigung (03:13), damit vor jeder Zusammenführung ein Stand gesichert ist.
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hubspot-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pakete installieren
+        run: pip install requests openpyxl pyzipper
+
+      - name: Backup erstellen und in SharePoint ablegen
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+          MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
+          SP_SHARE_LINK: ${{ vars.SP_SHARE_LINK }}
+          SP_DRIVE_ID: ${{ vars.SP_DRIVE_ID }}
+          SP_FOLDER_ID: ${{ vars.SP_FOLDER_ID }}
+          KEEP_DAILY: ${{ vars.KEEP_DAILY || '30' }}
+          KEEP_MONTHLY: ${{ vars.KEEP_MONTHLY || '12' }}
+          DOWNLOAD_FILES: ${{ vars.DOWNLOAD_FILES || '1' }}
+        run: python hubspot_backup.py
+      # Bewusst kein Upload als GitHub-Artefakt: Kundendaten bleiben nur im SharePoint.
